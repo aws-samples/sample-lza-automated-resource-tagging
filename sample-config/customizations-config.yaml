@@ -1,0 +1,66 @@
+# Sample LZA customizations-config.yaml — Per-account deployment
+#
+# This uses cloudFormationStacks (not cloudFormationStackSets) to enable
+# per-account tag customization. Each account gets its own stack entry
+# with unique tags passed via the AutomationTags parameter.
+#
+# UPDATE: Before deploying, replace all <placeholder> values with your
+# actual account names, regions, and tag values.
+#
+# For OU-level deployment with the same tags, see customizations-config-stackset.yaml.
+
+customizations:
+  cloudFormationStacks:
+    # ---- Production Account ----
+    # UPDATE: Replace 'ProductionAccount' with your account name from accounts-config.yaml
+    - deploymentTargets:
+        accounts:
+          - ProductionAccount
+      name: ResourceTaggingAutomation-Production
+      description: Auto-tagging for Production account
+      regions:
+        - <home-region>               # UPDATE: your LZA home region (e.g., us-east-1)
+      runOrder: 1
+      template: customizations/resource-tagging-automation.yaml
+      terminationProtection: false
+      parameters:
+        - name: AutomationTags
+          value: '{"BillingCode": "PROD-001", "CostCenter": "CC-PROD", "Department": "Engineering", "Environment": "Production"}'
+        - name: TrailName
+          value: resource-tagging-automation-trail
+
+    # ---- Staging Account ----
+    # UPDATE: Replace 'StagingAccount' with your account name from accounts-config.yaml
+    - deploymentTargets:
+        accounts:
+          - StagingAccount
+      name: ResourceTaggingAutomation-Staging
+      description: Auto-tagging for Staging account
+      regions:
+        - <home-region>               # UPDATE: your LZA home region
+      runOrder: 1
+      template: customizations/resource-tagging-automation.yaml
+      terminationProtection: false
+      parameters:
+        - name: AutomationTags
+          value: '{"BillingCode": "STG-001", "CostCenter": "CC-STAGING", "Department": "QA", "Environment": "Staging"}'
+        - name: TrailName
+          value: resource-tagging-automation-trail
+
+    # ---- Development Account ----
+    # UPDATE: Replace 'DevAccount' with your account name from accounts-config.yaml
+    - deploymentTargets:
+        accounts:
+          - DevAccount
+      name: ResourceTaggingAutomation-Dev
+      description: Auto-tagging for Development account
+      regions:
+        - <home-region>               # UPDATE: your LZA home region
+      runOrder: 1
+      template: customizations/resource-tagging-automation.yaml
+      terminationProtection: false
+      parameters:
+        - name: AutomationTags
+          value: '{"BillingCode": "DEV-001", "CostCenter": "CC-DEV", "Department": "Engineering", "Environment": "Development"}'
+        - name: TrailName
+          value: resource-tagging-automation-trail

@@ -1,0 +1,28 @@
+# Sample LZA customizations-config.yaml — OU-level deployment using StackSets
+#
+# Use this approach when all accounts in an OU should get the SAME tags.
+# Simpler configuration but no per-account tag customization.
+#
+# UPDATE: Before deploying, replace all <placeholder> values with your
+# actual OU names, regions, and tag values.
+#
+# For per-account deployment with unique tags, see customizations-config.yaml.
+
+customizations:
+  cloudFormationStackSets:
+    # UPDATE: Replace 'Workloads' with your OU name from organization-config.yaml
+    - capabilities:
+        - CAPABILITY_IAM
+      deploymentTargets:
+        organizationalUnits:
+          - Workloads                 # UPDATE: your OU name
+      name: ResourceTaggingAutomation
+      description: Auto-tagging for all workload accounts
+      regions:
+        - <home-region>               # UPDATE: your LZA home region (e.g., us-east-1)
+      template: customizations/resource-tagging-automation.yaml
+      parameters:
+        - name: AutomationTags
+          value: '{"BillingCode": "WL-001", "CostCenter": "CC-WORKLOADS", "Department": "Platform"}'
+        - name: TrailName
+          value: resource-tagging-automation-trail
