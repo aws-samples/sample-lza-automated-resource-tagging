@@ -1,0 +1,34 @@
+# Sample LZA customizations-config.yaml — OU-level deployment using StackSets (lightweight, no per-account trail)
+#
+# Use this approach when all accounts in an OU should get the SAME tags.
+# Simpler configuration but no per-account tag customization.
+#
+# This configuration uses the lightweight template, which relies on the
+# existing AWS Control Tower organization trail for EventBridge events
+# instead of deploying a per-account CloudTrail trail. See the README
+# for trade-offs between the standard and lightweight templates.
+#
+# UPDATE: Before deploying, replace all <placeholder> values with your
+# actual OU names, regions, and tag values.
+#
+# For per-account deployment with unique tags, see customizations-config-lightweight.yaml.
+
+customizations:
+  cloudFormationStackSets:
+    # UPDATE: Replace 'Workloads' with your OU name from organization-config.yaml
+    - capabilities:
+        - CAPABILITY_IAM
+      deploymentTargets:
+        organizationalUnits:
+          - Workloads                 # UPDATE: your OU name
+      name: ResourceTaggingAutomation
+      description: Auto-tagging for all workload accounts (lightweight, no per-account trail)
+      regions:                        # UPDATE: list ALL governed regions where users create resources
+        - us-east-1
+        - us-east-2
+        - us-west-1
+        - us-west-2
+      template: customizations/resource-tagging-automation-lightweight.yaml
+      parameters:
+        - name: AutomationTags
+          value: '{"BillingCode": "WL-001", "CostCenter": "CC-WORKLOADS", "Department": "Platform"}'

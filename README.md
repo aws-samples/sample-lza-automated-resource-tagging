@@ -7,6 +7,7 @@
 - [Overview](#overview)
 - [Tagging Governance on AWS — A Layered Approach](#tagging-governance-on-aws--a-layered-approach)
 - [When to Use This Solution](#when-to-use-this-solution)
+- [Template Options](#template-options)
 - [Architecture](#architecture)
 - [Supported Resource Types](#supported-resource-types)
 - [Auto-Tagged Metadata](#auto-tagged-metadata)
@@ -14,6 +15,8 @@
 - [Deployment](#deployment)
   - [Option A: Per-Account Deployment (cloudFormationStacks)](#option-a-per-account-deployment-cloudformationstacks)
   - [Option B: Per-OU Deployment (cloudFormationStackSets)](#option-b-per-ou-deployment-cloudformationstacksets)
+  - [Option C: Lightweight Per-Account (cloudFormationStacks)](#option-c-lightweight-per-account-cloudformationstacks)
+  - [Option D: Lightweight Per-OU (cloudFormationStackSets)](#option-d-lightweight-per-ou-cloudformationstacksets)
 - [Onboarding New Accounts](#onboarding-new-accounts)
 - [Parameters](#parameters)
 - [LZA Compatibility Notes](#lza-compatibility-notes)
@@ -33,6 +36,7 @@ This sample adapts the [aws-samples/resource-tagging-automation](https://github.
 - **Per-OU deployment** via `cloudFormationStackSets` for uniform tagging across an entire Organizational Unit.
 - **CDK CfnInclude compatibility** so the template deploys cleanly through the LZA pipeline.
 - **Governance context** — positioning automated tagging within the broader layered approach to tagging governance on AWS.
+- **Lightweight template option** (`resource-tagging-automation-lightweight.yaml`) that removes the per-account CloudTrail trail and S3 bucket, relying instead on the existing AWS Control Tower organization trail. This reduces per-account cost by ~50% at scale.
 
 > **Important:** This solution is provided as a sample implementation. You must review, evaluate, assess, and approve the solution in compliance with your organization's particular security, tagging, and operational requirements.
 
@@ -98,21 +102,50 @@ For the strongest governance posture, layer this solution with other controls:
 └─────────────────────────────────────────────────────────────────┘
 ```
 
+## Template Options
+
+This repo includes two CloudFormation templates. Both deploy the same EventBridge rule, Lambda function, KMS key, DLQ, and IAM role — they differ only in how CloudTrail events reach EventBridge.
+
+| | Standard | Lightweight |
+|---|---|---|
+| **Template** | `resource-tagging-automation.yaml` | `resource-tagging-automation-lightweight.yaml` |
+| **CloudTrail** | Deploys a per-account trail + encrypted S3 bucket | No trail — relies on the Control Tower organization trail |
+| **Resources deployed** | 12 (trail, S3 bucket, bucket policy, KMS key, log group, DLQ, DLQ policy, DLQ alarm, IAM role, Lambda, EventBridge rule, Lambda permission) | 9 (KMS key, log group, DLQ, DLQ policy, DLQ alarm, IAM role, Lambda, EventBridge rule, Lambda permission) |
+| **Cost per account** | ~$3–6/month | ~$1–2/month |
+| **Dependency** | Self-contained — works independently | Requires the Control Tower organization trail to be active |
+| **When to use** | When you need the solution to be fully self-contained, or when Control Tower is not managing CloudTrail | When Control Tower is active and you want to minimize cost and resource footprint |
+
+**How the lightweight template works:** AWS Control Tower creates an organization-level CloudTrail trail in the management account. CloudTrail automatically places a copy of that trail in every member account. That trail copy delivers `AWS API Call via CloudTrail` events to EventBridge on each member account's local default event bus — which is exactly what the EventBridge rule needs. The per-account trail in the standard template does the same thing, so it's redundant in Control Tower environments.
+
+**Trade-off:** With the lightweight template, if someone disables the Control Tower organization trail (a drift event), auto-tagging stops silently. With the standard template, the solution is self-contained and unaffected by changes to the org trail.
+
 ## Architecture
 
+### Standard template
+
 ```
-CloudTrail (captures API events)
+Per-account CloudTrail trail (captures API events)
     ↓
 EventBridge (filters resource creation events)
     ↓
 Lambda (applies tags via Resource Groups Tagging API)
 ```
 
-Each target account gets its own CloudTrail → EventBridge → Lambda stack. Tags are passed as a CloudFormation parameter (`AutomationTags`), allowing each account to have a unique set of tags.
+### Lightweight template
+
+```
+Control Tower organization trail (already active in every member account)
+    ↓
+EventBridge (filters resource creation events)
+    ↓
+Lambda (applies tags via Resource Groups Tagging API)
+```
+
+Each target account gets its own EventBridge → Lambda stack. Tags are passed as a CloudFormation parameter (`AutomationTags`), allowing each account to have a unique set of tags.
 
 **How it works:**
 
-1. A per-account CloudTrail trail captures API events and writes them to an encrypted S3 bucket.
+1. **Standard template:** A per-account CloudTrail trail captures API events and writes them to an encrypted S3 bucket. **Lightweight template:** The existing Control Tower organization trail provides the same events — no additional trail is deployed.
 2. An EventBridge rule filters for resource creation events (e.g., `RunInstances`, `CreateBucket`, `CreateDBInstance`).
 3. A Lambda function extracts the resource ARN from the event, then applies the configured tags plus `CreatedBy` and `CreatedDate` metadata using the Resource Groups Tagging API.
 
@@ -151,13 +184,14 @@ In addition to your custom tags, every resource automatically receives:
 
 ### Step 1: Copy the template
 
-Copy `resource-tagging-automation.yaml` into your LZA configuration repository:
+Copy the template(s) into your LZA configuration repository. Choose the standard template, the lightweight template, or both:
 
 ```
 aws-accelerator-config/
 ├── customizations/
-│   └── resource-tagging-automation.yaml   ← copy here
-└── customizations-config.yaml             ← update this
+│   ├── resource-tagging-automation.yaml              ← standard (self-contained)
+│   └── resource-tagging-automation-lightweight.yaml   ← lightweight (no per-account trail)
+└── customizations-config.yaml                         ← update this
 ```
 
 ### Step 2: Configure deployment targets
@@ -177,7 +211,10 @@ customizations:
       name: ResourceTaggingAutomation-Production
       description: Auto-tagging for Production
       regions:
-        - us-east-1                     # UPDATE: your LZA home region
+        - us-east-1                     # UPDATE: list ALL governed regions
+        - us-east-2
+        - us-west-1
+        - us-west-2
       runOrder: 1
       template: customizations/resource-tagging-automation.yaml
       terminationProtection: false
@@ -192,7 +229,10 @@ customizations:
       name: ResourceTaggingAutomation-Staging
       description: Auto-tagging for Staging
       regions:
-        - us-east-1                     # UPDATE: your LZA home region
+        - us-east-1                     # UPDATE: list ALL governed regions
+        - us-east-2
+        - us-west-1
+        - us-west-2
       runOrder: 1
       template: customizations/resource-tagging-automation.yaml
       terminationProtection: false
@@ -220,7 +260,10 @@ customizations:
       name: ResourceTaggingAutomation
       description: Auto-tagging for all workload accounts
       regions:
-        - us-east-1                     # UPDATE: your LZA home region
+        - us-east-1                     # UPDATE: list ALL governed regions
+        - us-east-2
+        - us-west-1
+        - us-west-2
       template: customizations/resource-tagging-automation.yaml
       parameters:
         - name: AutomationTags
@@ -230,6 +273,62 @@ customizations:
 ```
 
 See [`sample-config/customizations-config-stackset.yaml`](sample-config/customizations-config-stackset.yaml) for a complete example.
+
+### Option C: Lightweight Per-Account (cloudFormationStacks)
+
+Same as Option A but uses the lightweight template — no per-account CloudTrail trail or S3 bucket. Requires the Control Tower organization trail to be active.
+
+```yaml
+customizations:
+  cloudFormationStacks:
+    - deploymentTargets:
+        accounts:
+          - ProductionAccount           # UPDATE: your account name from accounts-config.yaml
+      name: ResourceTaggingAutomation-Production
+      description: Auto-tagging for Production (lightweight, no per-account trail)
+      regions:
+        - us-east-1                     # UPDATE: list ALL governed regions
+        - us-east-2
+        - us-west-1
+        - us-west-2
+      runOrder: 1
+      template: customizations/resource-tagging-automation-lightweight.yaml
+      terminationProtection: false
+      parameters:
+        - name: AutomationTags
+          value: '{"BillingCode": "PROD-001", "CostCenter": "CC-PROD", "Department": "Engineering"}'
+```
+
+Note: No `TrailName` parameter — the lightweight template does not deploy a trail.
+
+See [`sample-config/customizations-config-lightweight.yaml`](sample-config/customizations-config-lightweight.yaml) for a complete example.
+
+### Option D: Lightweight Per-OU (cloudFormationStackSets)
+
+Same as Option B but uses the lightweight template:
+
+```yaml
+customizations:
+  cloudFormationStackSets:
+    - capabilities:
+        - CAPABILITY_IAM
+      deploymentTargets:
+        organizationalUnits:
+          - Workloads                   # UPDATE: your OU name from organization-config.yaml
+      name: ResourceTaggingAutomation
+      description: Auto-tagging for all workload accounts (lightweight, no per-account trail)
+      regions:
+        - us-east-1                     # UPDATE: list ALL governed regions
+        - us-east-2
+        - us-west-1
+        - us-west-2
+      template: customizations/resource-tagging-automation-lightweight.yaml
+      parameters:
+        - name: AutomationTags
+          value: '{"BillingCode": "WL-001", "CostCenter": "CC-WORKLOADS", "Department": "Platform"}'
+```
+
+See [`sample-config/customizations-config-lightweight-stackset.yaml`](sample-config/customizations-config-lightweight-stackset.yaml) for a complete example.
 
 ### Step 3: Push and trigger the pipeline
 
@@ -255,12 +354,22 @@ To add tagging automation to a new account:
 
 ## Parameters
 
+### Standard template (`resource-tagging-automation.yaml`)
+
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `AutomationTags` | `''` (empty) | JSON string of key-value pairs to apply as tags. Example: `{"BillingCode": "PROD-001", "CostCenter": "CC-PROD"}` |
 | `LambdaAutoTaggingFunctionName` | `resource-tagging-automation-function` | Name of the Lambda function |
 | `EventBridgeRuleName` | `resource-tagging-automation-rules` | Name of the EventBridge rule |
 | `TrailName` | `resource-tagging-automation-trail` | Name of the CloudTrail trail |
+
+### Lightweight template (`resource-tagging-automation-lightweight.yaml`)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `AutomationTags` | `''` (empty) | JSON string of key-value pairs to apply as tags. Example: `{"BillingCode": "PROD-001", "CostCenter": "CC-PROD"}` |
+| `LambdaAutoTaggingFunctionName` | `resource-tagging-automation-function` | Name of the Lambda function |
+| `EventBridgeRuleName` | `resource-tagging-automation-rules` | Name of the EventBridge rule |
 
 ## LZA Compatibility Notes
 
@@ -275,20 +384,24 @@ If you modify this template, validate that it still synthesizes through the LZA 
 
 ## Security Considerations
 
-The template includes the following security controls:
+Both templates include the following security controls:
 
-- **KMS Encryption**: A single customer-managed KMS key (with automatic annual rotation) encrypts CloudTrail logs (at rest in S3 and in the trail itself), Lambda CloudWatch Logs, Lambda environment variables, and the dead-letter queue. The key policy is scoped to only the specific trail and log group using `aws:SourceArn` and `kms:EncryptionContext` conditions, and to the Lambda service via `kms:ViaService`.
-- **S3 Bucket**: KMS encryption (via the shared CMK), public access block, versioning, HTTPS-only deny policy, 365-day lifecycle expiration. Bucket key enabled to reduce KMS API costs.
-- **CloudTrail**: Log file validation enabled, multi-region trail, KMS-encrypted.
+- **KMS Encryption**: A single customer-managed KMS key (with automatic annual rotation) encrypts Lambda CloudWatch Logs, Lambda environment variables, and the dead-letter queue. The standard template additionally encrypts CloudTrail logs (at rest in S3 and in the trail itself). The key policy is scoped using `kms:EncryptionContext` and `kms:ViaService` conditions.
+- **S3 Bucket** (standard template only): KMS encryption (via the shared CMK), public access block, versioning, HTTPS-only deny policy, 365-day lifecycle expiration. Bucket key enabled to reduce KMS API costs.
+- **CloudTrail** (standard template only): Log file validation enabled, multi-region trail, KMS-encrypted.
 - **Lambda Logs**: Dedicated CloudWatch Log Group with KMS encryption and 90-day retention, created before the Lambda function to ensure logs are encrypted from the first invocation.
 - **Lambda**: Reserved concurrent executions (10) to limit blast radius. Explicit handler dispatch map to prevent code injection. Environment variables encrypted with KMS. Dead-letter queue captures failed invocations.
 - **Dead-Letter Queue**: KMS-encrypted SQS queue captures failed Lambda invocations for retry and monitoring. CloudWatch alarm triggers when messages arrive in the DLQ. Queue policy restricts SendMessage to the specific Lambda function ARN.
 - **IAM**: Least-privilege role with `aws:PrincipalAccount` condition on all tagging permissions, scoping the role to only operate within the deploying account. DLQ access scoped to the specific queue ARN. Uses `AWSLambdaBasicExecutionRole` managed policy for CloudWatch Logs access.
 - **Partition-aware ARNs**: All ARN references use `${AWS::Partition}` (CloudFormation) or runtime partition detection (Lambda) to support AWS, AWS GovCloud, and AWS China regions.
 
+The lightweight template has a smaller attack surface — no S3 bucket to manage, no CloudTrail key policy statement, and fewer resources overall.
+
 ## Cost
 
-You are responsible for the cost of the AWS services used while running this solution. The primary cost drivers per account are:
+You are responsible for the cost of the AWS services used while running this solution.
+
+### Standard template
 
 | AWS Service | Estimated Monthly Cost |
 |-------------|----------------------|
@@ -302,15 +415,28 @@ You are responsible for the cost of the AWS services used while running this sol
 | Amazon EventBridge | No additional charge for AWS service events |
 | **Total per account** | **~$3–6/month** |
 
-Costs will vary based on the volume of resource creation events in each account. The estimates above assume a low-to-moderate workload.
-
 **Scaling note:** For large deployments (50–200+ accounts), the primary cost driver is CloudTrail. Each account gets its own trail, and the trail is multi-region by default — meaning it writes digest files for every AWS region (~20+) every hour, even if those regions are unused. For a 100-account deployment, expect ~$300–600/month total. To reduce costs, you can set `IsMultiRegionTrail` to `false` in the template if you deploy the stack to every region in your landing zone, or if resources are only created in the deployed region. You can also reduce the S3 lifecycle `ExpirationInDays` from 365 to a shorter period (e.g., 90 days) since these logs exist to feed EventBridge, not for compliance archival.
+
+### Lightweight template
+
+| AWS Service | Estimated Monthly Cost |
+|-------------|----------------------|
+| AWS KMS (encryption key + API calls) | ~$1.00 |
+| AWS Lambda | < $1.00 (free tier eligible) |
+| Amazon CloudWatch Logs | < $1.00 |
+| Amazon SQS (dead-letter queue) | < $0.01 (free tier eligible) |
+| Amazon CloudWatch Alarms | < $0.10 |
+| Amazon EventBridge | No additional charge for AWS service events |
+| **Total per account** | **~$1–2/month** |
+
+The lightweight template eliminates the per-account CloudTrail trail and S3 bucket, which are the primary cost drivers in the standard template. For a 100-account deployment, expect ~$100–200/month total instead of ~$300–600/month.
 
 ## Troubleshooting
 
 | Issue | Resolution |
 |-------|-----------|
-| Lambda not invoked | Verify the CloudTrail trail is logging (`IsLogging: true`). Check that the EventBridge rule is enabled and the Lambda permission grants `events.amazonaws.com` invoke access. |
+| Lambda not invoked (standard) | Verify the CloudTrail trail is logging (`IsLogging: true`). Check that the EventBridge rule is enabled and the Lambda permission grants `events.amazonaws.com` invoke access. |
+| Lambda not invoked (lightweight) | Verify the Control Tower organization trail is active (`aws cloudtrail get-trail-status --name aws-controltower-BaselineCloudTrail --region <home-region>`). The trail must show `IsLogging: true`. If it was disabled, re-enable it from the Control Tower console. |
 | Tags not applied | Check Lambda CloudWatch Logs for errors. Verify the `AutomationTags` parameter is valid JSON. Ensure the IAM role has the required tagging permissions for the resource type. |
 | CDK assembly errors | Ensure the template has no `Conditions` block, no `DeletionPolicy: Retain`, and no nested intrinsic functions. See [LZA Compatibility Notes](#lza-compatibility-notes). |
 | Stack name conflicts | Each `cloudFormationStacks` entry must have a unique `name`. If redeploying, delete the existing stack first or use a different name. |
@@ -320,10 +446,12 @@ Costs will vary based on the volume of resource creation events in each account.
 
 - **Existing resources**: This solution only tags resources created *after* deployment. To tag existing resources, consider using [AWS Resource Explorer](https://aws.amazon.com/resourceexplorer/) with [Tag Editor](https://docs.aws.amazon.com/ARG/latest/userguide/tag-editor.html).
 - **Tag policies**: For tag standardization and compliance reporting, combine this solution with [AWS Organizations Tag Policies](https://docs.aws.amazon.com/organizations/latest/userguide/orgs_manage_policies_tag-policies.html) configured in your LZA `organization-config.yaml`. Tag Policies enforce allowed values and casing without disrupting resource creation.
-- **Multi-region**: The CloudTrail trail is configured as multi-region by default (`IsMultiRegionTrail: true`). This means a single-region deployment captures events from all regions, but the Lambda and EventBridge rule only exist in the deployed region — so only resources created in that region get tagged. For multi-region tagging, deploy the stack to each region in your landing zone. If you deploy to every region, consider setting `IsMultiRegionTrail` to `false` in the template to avoid redundant cross-region digest files, which reduces S3 write volume and cost. For landing zones restricted to a small number of regions (e.g., 4 US regions), the multi-region overhead is minimal.
-- **Control Tower CloudTrail**: If AWS Control Tower is managing an organization-level CloudTrail trail, the per-account trail in this solution is additive. This is by design — the per-account trail feeds EventBridge in the target account. There is no conflict, but you will see two trails per account.
+- **Multi-region**: Deploy the stack to every governed region in your landing zone. The EventBridge rule and Lambda only exist in the deployed region, so only resources created in that region get tagged. List all governed regions in the `regions` array of your `customizations-config.yaml` — LZA deploys the stack to each one. For the standard template, the CloudTrail trail is multi-region by default (`IsMultiRegionTrail: true`); if you deploy to every governed region, consider setting it to `false` to avoid redundant cross-region digest files and reduce S3 cost. For the lightweight template, the Control Tower organization trail already delivers events to all governed regions — no additional configuration needed. If your landing zone uses SCPs to deny non-governed regions, there is no tagging gap.
+- **Control Tower CloudTrail**: If using the standard template, the per-account trail is additive to the Control Tower organization trail. This is by design — the per-account trail feeds EventBridge in the target account. There is no conflict, but you will see two trails per account. If using the lightweight template, the Control Tower organization trail is the sole event source — there is no per-account trail and no duplication.
+- **Switching between templates**: You can switch from the standard template to the lightweight template (or vice versa) by updating `customizations-config.yaml` to point to the other template file. However, you must first delete the existing stack in each account (LZA does not auto-delete stacks when you change the template reference). Delete the stack, clean up any orphaned resources (CloudWatch Log Groups named `/aws/lambda/resource-tagging-automation-function` survive stack deletion), then redeploy with the new template.
+- **LZA CloudTrail settings**: The `cloudtrail` section in `global-config.yaml` controls whether LZA manages its own CloudTrail resources. Neither template depends on LZA-managed trails. The standard template deploys its own trail; the lightweight template relies on the Control Tower organization trail. Your `global-config.yaml` CloudTrail settings can be anything without affecting the tagging automation.
 - **Dead-letter queue**: The Lambda function includes an SQS dead-letter queue (DLQ) with a CloudWatch alarm. Failed invocations are captured in the DLQ for investigation. Monitor the `resource-tagging-automation-function-dlq-alarm` alarm for failures.
-- **AWS Security Hub**: If Security Hub is enabled, it may generate findings for the trail S3 bucket (missing access logging). This is by design — enabling access logging on a CloudTrail log bucket creates a circular dependency. The bucket is protected by KMS encryption, versioning, and HTTPS-only policy instead.
+- **AWS Security Hub** (standard template only): If Security Hub is enabled, it may generate findings for the trail S3 bucket (missing access logging). This is by design — enabling access logging on a CloudTrail log bucket creates a circular dependency. The bucket is protected by KMS encryption, versioning, and HTTPS-only policy instead. The lightweight template avoids this entirely since it has no S3 bucket.
 
 ## References
 
