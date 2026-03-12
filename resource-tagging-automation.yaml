@@ -5,10 +5,12 @@
 
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
-  LZA-compatible adaptation of aws-samples/resource-tagging-automation.
-  Automatically tags newly created AWS resources using CloudTrail, EventBridge,
-  and Lambda. Supports 30+ resource types with per-account tag customization.
-  Compatible with CDK CfnInclude for LZA cloudFormationStacks deployment.
+  LZA adaptation of aws-samples/resource-tagging-automation.
+  Relies on the existing AWS Control Tower organization trail for EventBridge
+  events. Deploys EventBridge rule, Lambda, KMS, DLQ, and IAM only — no
+  per-account CloudTrail trail or S3 bucket. Optional retroactive backfill
+  tags existing resources on first deploy. Supports 30+ resource types
+  with per-account tag customization via LZA cloudFormationStacks.
 
 Parameters:
   AutomationTags:
@@ -28,21 +30,41 @@ Parameters:
     Default: resource-tagging-automation-rules
     Description: Name of the EventBridge rule
 
-  TrailName:
+  EnableRetroactiveTagging:
     Type: String
-    Default: resource-tagging-automation-trail
-    Description: Name of the CloudTrail trail
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: >
+      Set to 'true' to run a one-time backfill that tags all existing
+      resources missing the MarkerTagKey. Runs once on stack create via
+      a CloudFormation Custom Resource. Safe to leave as 'true' — the
+      backfill is idempotent and skips already-tagged resources.
+      Set to 'false' to skip the backfill (event-driven tagging only).
+
+  MarkerTagKey:
+    Type: String
+    Default: BillingCode
+    Description: >
+      Tag key used by the retroactive backfill to detect already-tagged
+      resources. Resources with this tag key are skipped. Should match
+      one of the keys in AutomationTags. Only used when
+      EnableRetroactiveTagging is 'true'.
+
+Conditions:
+  RetroactiveTaggingEnabled: !Equals [!Ref EnableRetroactiveTagging, 'true']
 
 Resources:
 
   # ============================================================
-  # KMS — encryption for CloudTrail logs and Lambda CloudWatch Logs
+  # KMS — encryption for Lambda CloudWatch Logs and environment variables
   # ============================================================
 
   EncryptionKey:
     Type: AWS::KMS::Key
     Properties:
-      Description: Encryption key for resource tagging automation (CloudTrail and Lambda logs)
+      Description: Encryption key for resource tagging automation (Lambda logs and environment variables)
       EnableKeyRotation: true
       KeyPolicy:
         Version: '2012-10-17'
@@ -53,17 +75,6 @@ Resources:
               AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
             Action: kms:*
             Resource: '*'
-          - Sid: AllowCloudTrailEncrypt
-            Effect: Allow
-            Principal:
-              Service: cloudtrail.amazonaws.com
-            Action:
-              - kms:GenerateDataKey*
-              - kms:DescribeKey
-            Resource: '*'
-            Condition:
-              StringEquals:
-                aws:SourceArn: !Sub arn:${AWS::Partition}:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${TrailName}
           - Sid: AllowCloudWatchLogsEncrypt
             Effect: Allow
             Principal:
@@ -76,7 +87,7 @@ Resources:
             Resource: '*'
             Condition:
               ArnLike:
-                kms:EncryptionContext:aws:logs:arn: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${LambdaAutoTaggingFunctionName}
+                kms:EncryptionContext:aws:logs:arn: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${LambdaAutoTaggingFunctionName}*
           - Sid: AllowCloudWatchLogsDescribeKey
             Effect: Allow
             Principal:
@@ -104,81 +115,6 @@ Resources:
     Properties:
       AliasName: alias/resource-tagging-automation-key
       TargetKeyId: !Ref EncryptionKey
-
-  # ============================================================
-  # CloudTrail — captures API events for EventBridge to filter
-  # ============================================================
-
-  TrailBucket:
-    Type: AWS::S3::Bucket
-    Properties:
-      BucketEncryption:
-        ServerSideEncryptionConfiguration:
-          - ServerSideEncryptionByDefault:
-              SSEAlgorithm: aws:kms
-              KMSMasterKeyID: !GetAtt EncryptionKey.Arn
-            BucketKeyEnabled: true
-      PublicAccessBlockConfiguration:
-        BlockPublicAcls: true
-        BlockPublicPolicy: true
-        IgnorePublicAcls: true
-        RestrictPublicBuckets: true
-      VersioningConfiguration:
-        Status: Enabled
-      LifecycleConfiguration:
-        Rules:
-          - Id: ExpireOldLogs
-            Status: Enabled
-            ExpirationInDays: 365
-
-  TrailBucketPolicy:
-    Type: AWS::S3::BucketPolicy
-    Properties:
-      Bucket: !Ref TrailBucket
-      PolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Sid: AWSCloudTrailAclCheck
-            Effect: Allow
-            Principal:
-              Service: cloudtrail.amazonaws.com
-            Action: s3:GetBucketAcl
-            Resource: !Sub arn:${AWS::Partition}:s3:::${TrailBucket}
-            Condition:
-              StringEquals:
-                aws:SourceArn: !Sub arn:${AWS::Partition}:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${TrailName}
-          - Sid: AWSCloudTrailWrite
-            Effect: Allow
-            Principal:
-              Service: cloudtrail.amazonaws.com
-            Action: s3:PutObject
-            Resource: !Sub arn:${AWS::Partition}:s3:::${TrailBucket}/AWSLogs/${AWS::AccountId}/*
-            Condition:
-              StringEquals:
-                s3:x-amz-acl: bucket-owner-full-control
-                aws:SourceArn: !Sub arn:${AWS::Partition}:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${TrailName}
-          - Sid: DenyUnencryptedTransport
-            Effect: Deny
-            Principal: '*'
-            Action: s3:*
-            Resource:
-              - !Sub arn:${AWS::Partition}:s3:::${TrailBucket}
-              - !Sub arn:${AWS::Partition}:s3:::${TrailBucket}/*
-            Condition:
-              Bool:
-                aws:SecureTransport: 'false'
-
-  Trail:
-    Type: AWS::CloudTrail::Trail
-    DependsOn: TrailBucketPolicy
-    Properties:
-      S3BucketName: !Ref TrailBucket
-      IsLogging: true
-      TrailName: !Ref TrailName
-      EnableLogFileValidation: true
-      IncludeGlobalServiceEvents: true
-      IsMultiRegionTrail: true
-      KMSKeyId: !GetAtt EncryptionKey.Arn
 
   # ============================================================
   # Lambda CloudWatch Log Group — encrypted with KMS
@@ -262,6 +198,10 @@ Resources:
                 Effect: Allow
                 Action:
                   - tag:TagResources
+                  - tag:GetResources
+                  - tag:GetTagKeys
+                  - tag:GetTagValues
+                  - tag:UntagResources
                 Resource: '*'
                 Condition:
                   StringEquals:
@@ -811,7 +751,7 @@ Resources:
 
               # Add CreatedBy and CreatedDate metadata
               res_tags['CreatedBy'] = get_identity(event)
-              res_tags['CreatedDate'] = event.get('detail', {}).get('eventTime', datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'))
+              res_tags['CreatedDate'] = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 
               logger.info(f'Tagging {len(resARNs)} resource(s): {resARNs}')
 
@@ -947,22 +887,171 @@ Resources:
       Principal: events.amazonaws.com
       SourceArn: !GetAtt EventBridgeRule.Arn
 
+  # ============================================================
+  # Retroactive Backfill (conditional) — tags existing resources
+  # Only created when EnableRetroactiveTagging = 'true'
+  # ============================================================
+
+  RetroactiveLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: RetroactiveTaggingEnabled
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${LambdaAutoTaggingFunctionName}-backfill
+      RetentionInDays: 90
+      KmsKeyId: !GetAtt EncryptionKey.Arn
+
+  RetroactiveBackfillFunction:
+    Type: AWS::Lambda::Function
+    Condition: RetroactiveTaggingEnabled
+    DependsOn: RetroactiveLogGroup
+    Properties:
+      Role: !GetAtt LambdaExecutionRole.Arn
+      FunctionName: !Sub ${LambdaAutoTaggingFunctionName}-backfill
+      Handler: index.handler
+      Runtime: python3.13
+      Timeout: 900
+      MemorySize: 512
+      KmsKeyArn: !GetAtt EncryptionKey.Arn
+      Environment:
+        Variables:
+          TAGS_JSON: !Ref AutomationTags
+          MARKER_TAG_KEY: !Ref MarkerTagKey
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import json
+          import logging
+          import os
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          BATCH_SIZE = 20  # tag_resources API limit
+
+          def handler(event, context):
+              """CloudFormation Custom Resource handler."""
+              logger.info(f'RequestType: {event.get("RequestType")}')
+
+              # Only run on Create — nothing to do on Update or Delete
+              if event.get('RequestType') != 'Create':
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                      'Message': f'{event.get("RequestType")} — nothing to do',
+                      'Tagged': '0', 'Skipped': '0', 'Failed': '0'
+                  })
+                  return
+
+              try:
+                  result = tag_existing_resources()
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, result)
+              except Exception as e:
+                  logger.error(f'Failed: {e}')
+                  # Send SUCCESS even on error to avoid blocking stack creation.
+                  # The backfill is best-effort — check CloudWatch Logs for details.
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                      'Message': f'Backfill completed with errors: {str(e)}',
+                      'Tagged': '0', 'Skipped': '0', 'Failed': '0'
+                  })
+
+          def tag_existing_resources():
+              """Scan all resources and tag those missing the marker tag."""
+              tags_json = os.environ.get('TAGS_JSON', '{}')
+              marker_key = os.environ.get('MARKER_TAG_KEY', 'BillingCode')
+
+              try:
+                  tags = json.loads(tags_json)
+              except json.JSONDecodeError:
+                  logger.error(f'Invalid TAGS_JSON: {tags_json}')
+                  return {'Message': 'Invalid TAGS_JSON', 'Tagged': '0', 'Skipped': '0', 'Failed': '0'}
+
+              if not tags:
+                  return {'Message': 'No tags configured', 'Tagged': '0', 'Skipped': '0', 'Failed': '0'}
+
+              client = boto3.client('resourcegroupstaggingapi')
+              tagged_count = 0
+              skipped_count = 0
+              failed_count = 0
+              pagination_token = ''
+
+              while True:
+                  params = {'ResourcesPerPage': 100}
+                  if pagination_token:
+                      params['PaginationToken'] = pagination_token
+
+                  response = client.get_resources(**params)
+
+                  untagged_arns = []
+                  for resource in response.get('ResourceTagMappingList', []):
+                      arn = resource['ResourceARN']
+                      existing_keys = {t['Key'] for t in resource.get('Tags', [])}
+
+                      if marker_key in existing_keys:
+                          skipped_count += 1
+                      else:
+                          untagged_arns.append(arn)
+
+                  # Tag in batches
+                  for i in range(0, len(untagged_arns), BATCH_SIZE):
+                      batch = untagged_arns[i:i + BATCH_SIZE]
+                      try:
+                          resp = client.tag_resources(
+                              ResourceARNList=batch,
+                              Tags=tags
+                          )
+                          failures = resp.get('FailedResourcesMap', {})
+                          tagged_count += len(batch) - len(failures)
+                          failed_count += len(failures)
+                          if failures:
+                              for arn, err in failures.items():
+                                  logger.warning(f'Failed to tag {arn}: {err}')
+                      except Exception as e:
+                          logger.error(f'Batch tagging failed: {e}')
+                          failed_count += len(batch)
+
+                  pagination_token = response.get('PaginationToken', '')
+                  if not pagination_token:
+                      break
+
+              result = {
+                  'Message': 'Retroactive tagging complete',
+                  'Tagged': str(tagged_count),
+                  'Skipped': str(skipped_count),
+                  'Failed': str(failed_count)
+              }
+              logger.info(f'Result: {json.dumps(result)}')
+              return result
+
+  TriggerRetroactiveTagging:
+    Type: Custom::RetroactiveTagging
+    Condition: RetroactiveTaggingEnabled
+    Properties:
+      ServiceToken: !GetAtt RetroactiveBackfillFunction.Arn
+
 Outputs:
   LambdaFunctionArn:
     Description: ARN of the auto-tagging Lambda function
     Value: !GetAtt LambdaAutoTagging.Arn
-  TrailArn:
-    Description: ARN of the CloudTrail trail
-    Value: !GetAtt Trail.Arn
+  EncryptionKeyArn:
+    Description: ARN of the KMS key used for Lambda log and environment variable encryption
+    Value: !GetAtt EncryptionKey.Arn
   EventBridgeRuleArn:
     Description: ARN of the EventBridge rule
     Value: !GetAtt EventBridgeRule.Arn
-  EncryptionKeyArn:
-    Description: ARN of the KMS key used for CloudTrail and Lambda log encryption
-    Value: !GetAtt EncryptionKey.Arn
   DeadLetterQueueArn:
     Description: ARN of the dead-letter queue for failed tagging invocations
     Value: !GetAtt DeadLetterQueue.Arn
   DeadLetterQueueUrl:
     Description: URL of the dead-letter queue for reprocessing failed events
     Value: !Ref DeadLetterQueue
+  BackfillStatus:
+    Condition: RetroactiveTaggingEnabled
+    Description: Result of the retroactive tagging backfill
+    Value: !GetAtt TriggerRetroactiveTagging.Message
+  BackfillResourcesTagged:
+    Condition: RetroactiveTaggingEnabled
+    Description: Number of existing resources tagged by the backfill
+    Value: !GetAtt TriggerRetroactiveTagging.Tagged
+  BackfillResourcesSkipped:
+    Condition: RetroactiveTaggingEnabled
+    Description: Number of existing resources skipped (already tagged)
+    Value: !GetAtt TriggerRetroactiveTagging.Skipped

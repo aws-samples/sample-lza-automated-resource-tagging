@@ -3,6 +3,9 @@
 # Use this approach when all accounts in an OU should get the SAME tags.
 # Simpler configuration but no per-account tag customization.
 #
+# This template relies on the existing AWS Control Tower organization
+# trail for EventBridge events — no per-account CloudTrail trail is deployed.
+#
 # UPDATE: Before deploying, replace all <placeholder> values with your
 # actual OU names, regions, and tag values.
 #
@@ -18,11 +21,17 @@ customizations:
           - Workloads                 # UPDATE: your OU name
       name: ResourceTaggingAutomation
       description: Auto-tagging for all workload accounts
-      regions:
-        - <home-region>               # UPDATE: your LZA home region (e.g., us-east-1)
+      regions:                        # UPDATE: list ALL governed regions
+        - us-east-1
+        - us-east-2
+        - us-west-1
+        - us-west-2
       template: customizations/resource-tagging-automation.yaml
       parameters:
         - name: AutomationTags
           value: '{"BillingCode": "WL-001", "CostCenter": "CC-WORKLOADS", "Department": "Platform"}'
-        - name: TrailName
-          value: resource-tagging-automation-trail
+        # Optional: tag existing resources on first deploy
+        # - name: EnableRetroactiveTagging
+        #   value: 'true'
+        # - name: MarkerTagKey
+        #   value: BillingCode
