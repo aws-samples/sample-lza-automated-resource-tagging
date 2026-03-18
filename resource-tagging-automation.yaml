@@ -928,6 +928,7 @@ Resources:
           logger.setLevel(logging.INFO)
 
           BATCH_SIZE = 20  # tag_resources API limit
+          TIMEOUT_BUFFER_MS = 30000  # Stop 30s before Lambda timeout to send response
 
           def handler(event, context):
               """CloudFormation Custom Resource handler."""
@@ -942,7 +943,7 @@ Resources:
                   return
 
               try:
-                  result = tag_existing_resources()
+                  result = tag_existing_resources(context)
                   cfnresponse.send(event, context, cfnresponse.SUCCESS, result)
               except Exception as e:
                   logger.error(f'Failed: {e}')
@@ -953,7 +954,7 @@ Resources:
                       'Tagged': '0', 'Skipped': '0', 'Failed': '0'
                   })
 
-          def tag_existing_resources():
+          def tag_existing_resources(context):
               """Scan all resources and tag those missing the marker tag."""
               tags_json = os.environ.get('TAGS_JSON', '{}')
               marker_key = os.environ.get('MARKER_TAG_KEY', 'BillingCode')
@@ -971,9 +972,17 @@ Resources:
               tagged_count = 0
               skipped_count = 0
               failed_count = 0
+              timed_out = False
               pagination_token = ''
 
               while True:
+                  # Check remaining time before processing next page
+                  remaining_ms = context.get_remaining_time_in_millis()
+                  if remaining_ms < TIMEOUT_BUFFER_MS:
+                      logger.warning(f'Approaching timeout ({remaining_ms}ms remaining). Stopping to send response.')
+                      timed_out = True
+                      break
+
                   params = {'ResourcesPerPage': 100}
                   if pagination_token:
                       params['PaginationToken'] = pagination_token
@@ -992,6 +1001,13 @@ Resources:
 
                   # Tag in batches
                   for i in range(0, len(untagged_arns), BATCH_SIZE):
+                      # Check timeout before each batch
+                      if context.get_remaining_time_in_millis() < TIMEOUT_BUFFER_MS:
+                          logger.warning('Approaching timeout during tagging. Stopping.')
+                          failed_count += len(untagged_arns) - i
+                          timed_out = True
+                          break
+
                       batch = untagged_arns[i:i + BATCH_SIZE]
                       try:
                           resp = client.tag_resources(
@@ -1008,12 +1024,19 @@ Resources:
                           logger.error(f'Batch tagging failed: {e}')
                           failed_count += len(batch)
 
+                  if timed_out:
+                      break
+
                   pagination_token = response.get('PaginationToken', '')
                   if not pagination_token:
                       break
 
+              message = 'Retroactive tagging complete'
+              if timed_out:
+                  message = 'Retroactive tagging partially complete (approaching timeout). Redeploy to continue — already-tagged resources will be skipped.'
+
               result = {
-                  'Message': 'Retroactive tagging complete',
+                  'Message': message,
                   'Tagged': str(tagged_count),
                   'Skipped': str(skipped_count),
                   'Failed': str(failed_count)
