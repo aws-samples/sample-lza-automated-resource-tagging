@@ -38,7 +38,7 @@ This sample adapts the [aws-samples/resource-tagging-automation](https://github.
 
 The template relies on the existing AWS Control Tower organization trail for EventBridge events — no per-account CloudTrail trail or S3 bucket is deployed.
 
-> **Important:** This solution is provided as a sample implementation. You must review, evaluate, assess, and approve the solution in compliance with your organization's particular security, tagging, and operational requirements.
+> **Important:** This solution is provided as a sample implementation for testing and proof-of-concept purposes. It is not intended for production use without your own thorough testing and validation. You must review, evaluate, assess, and approve the solution in compliance with your organization's particular security, tagging, and operational requirements before deploying to any production environment.
 
 > **Security Notice:** This is sample code for educational and demonstration purposes. Before deploying to production:
 > - Conduct your own security review and threat modeling
