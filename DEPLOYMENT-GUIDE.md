@@ -201,7 +201,52 @@ Look for:
 - `BackfillResourcesTagged` — number of resources tagged
 - `BackfillResourcesSkipped` — number already tagged (had the MarkerTagKey)
 
-## Step 8: Clean Up Test Resources
+## Step 8: (Optional) Test Tag Value Updates
+
+If you need to update tag values on resources that were already tagged (e.g., changing `BillingCode` from `PROD-001` to `PROD-002`), the backfill supports a tag update mode.
+
+The event-driven Lambda automatically picks up new tag values for future resources when the stack is updated. To update existing resources:
+
+1. Update `AutomationTags` with the new values
+2. Set `MarkerTagKey` to `''` (empty string) — this tells the backfill to tag all resources, not just untagged ones
+3. Delete the stack and redeploy
+
+```yaml
+      parameters:
+        - name: AutomationTags
+          value: '{"BillingCode": "PROD-002", "CostCenter": "CC-PROD", "Department": "Engineering"}'
+        - name: EnableRetroactiveTagging
+          value: 'true'
+        - name: MarkerTagKey
+          value: ''
+```
+
+Delete the existing stack first (clean up orphaned log groups):
+
+```bash
+# In the target account
+aws logs delete-log-group \
+  --log-group-name /aws/lambda/resource-tagging-automation-function \
+  --region us-west-2 2>/dev/null
+
+aws logs delete-log-group \
+  --log-group-name /aws/lambda/resource-tagging-automation-function-backfill \
+  --region us-west-2 2>/dev/null
+```
+
+Push the updated config and trigger the pipeline. After deployment, verify the tags were updated:
+
+```bash
+aws sqs list-queue-tags \
+  --queue-url $QUEUE_URL \
+  --region us-west-2
+```
+
+You should see `BillingCode: PROD-002` (the updated value).
+
+After the update, set `MarkerTagKey` back to `BillingCode` in your config for normal operation.
+
+## Step 9: Clean Up Test Resources
 
 ```bash
 # Delete test security group

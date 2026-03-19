@@ -34,7 +34,7 @@ This sample adapts the [aws-samples/resource-tagging-automation](https://github.
 - **Per-OU deployment** via `cloudFormationStackSets` for uniform tagging across an entire Organizational Unit.
 - **CDK CfnInclude compatibility** so the template deploys cleanly through the LZA pipeline.
 - **Governance context** — positioning automated tagging within the broader layered approach to tagging governance on AWS.
-- **Optional retroactive tagging** — a one-time backfill that tags all existing resources in an account when the stack is first deployed. Enabled via a parameter (`EnableRetroactiveTagging`), it runs once on stack creation and is safe to leave enabled.
+- **Optional retroactive tagging** — a one-time backfill that tags all existing resources in an account when the stack is first deployed. Enabled via a parameter (`EnableRetroactiveTagging`), it runs once on stack creation and is safe to leave enabled. Also supports tag value updates on previously tagged resources by setting `MarkerTagKey` to empty.
 
 The template relies on the existing AWS Control Tower organization trail for EventBridge events — no per-account CloudTrail trail or S3 bucket is deployed.
 
@@ -267,20 +267,29 @@ To add tagging automation to a new account:
 
 ## Retroactive Tagging of Existing Resources
 
-The event-driven solution only tags resources created *after* deployment. To tag resources that already exist in an account, the template includes an optional retroactive backfill feature.
+The event-driven solution only tags resources created *after* deployment. To tag resources that already exist in an account, the template includes an optional retroactive backfill feature. The same feature also supports updating tag values on resources that were previously tagged.
 
-### How it works
+### Three Tagging Stages
+
+| Stage | What It Does | When It Runs |
+|-------|-------------|-------------|
+| **1. Event-driven tagging** | Tags new resources at creation time via EventBridge + Lambda | Continuously, after stack deployment |
+| **2. Retroactive backfill** | Tags existing resources that are missing the `MarkerTagKey` | Once, on stack creation (when `EnableRetroactiveTagging` is `'true'`) |
+| **3. Tag value update** | Re-tags all resources with updated `AutomationTags` values, overwriting previous values | On-demand: delete stack, set `MarkerTagKey` to `''`, redeploy |
+
+### How the backfill works
 
 When `EnableRetroactiveTagging` is set to `'true'`, the stack creates a second Lambda function and a CloudFormation Custom Resource. The Custom Resource triggers the backfill Lambda once on stack creation. The Lambda:
 
 1. Scans all resources in the account/region via the Resource Groups Tagging API
-2. Skips resources that already have the `MarkerTagKey` (default: `BillingCode`)
-3. Tags everything else with the configured `AutomationTags`
-4. Reports results in the CloudFormation stack outputs (`BackfillResourcesTagged`, `BackfillResourcesSkipped`)
+2. If `MarkerTagKey` is set (e.g., `BillingCode`): skips resources that already have that tag key (backfill mode)
+3. If `MarkerTagKey` is empty (`''`): tags all resources unconditionally (tag update mode)
+4. Tags matching resources with the configured `AutomationTags`
+5. Reports results in the CloudFormation stack outputs (`BackfillResourcesTagged`, `BackfillResourcesSkipped`)
 
 The backfill Lambda only runs on stack Create — not on Update or Delete. On subsequent LZA pipeline runs, it does nothing.
 
-### Enabling retroactive tagging
+### Stage 2: Initial backfill (tag existing untagged resources)
 
 Add these parameters to your `customizations-config.yaml` entry:
 
@@ -294,13 +303,35 @@ parameters:
     value: BillingCode
 ```
 
+Resources that already have `BillingCode` are skipped. Everything else gets the full `AutomationTags` applied.
+
+### Stage 3: Updating tag values on existing resources
+
+When tag values change (e.g., `BillingCode` changes from `PROD-001` to `PROD-002`), the event-driven Lambda picks up the new values for future resources automatically (the stack update refreshes the Lambda environment variable). To update tags on resources that already exist:
+
+1. Update `AutomationTags` with the new values
+2. Set `MarkerTagKey` to `''` (empty string) — this tells the backfill to tag all resources, not just untagged ones
+3. Delete the stack and redeploy (the backfill only runs on Create)
+
+```yaml
+parameters:
+  - name: AutomationTags
+    value: '{"BillingCode": "PROD-002", "CostCenter": "CC-PROD", "Department": "Engineering"}'
+  - name: EnableRetroactiveTagging
+    value: 'true'
+  - name: MarkerTagKey
+    value: ''
+```
+
+After the update completes, set `MarkerTagKey` back to `BillingCode` for normal operation so future backfills skip already-tagged resources.
+
 ### Verifying results
 
 After the LZA pipeline completes, check the CloudFormation stack outputs:
 
 - `BackfillStatus` — "Retroactive tagging complete"
 - `BackfillResourcesTagged` — number of resources that were tagged
-- `BackfillResourcesSkipped` — number of resources that already had the marker tag
+- `BackfillResourcesSkipped` — number of resources that already had the marker tag (0 when `MarkerTagKey` is empty)
 
 For detailed logs, check CloudWatch Logs: `/aws/lambda/<function-name>-backfill`
 
@@ -324,7 +355,7 @@ For spot-checking after the automated backfill, or for tagging a handful of reso
 | `LambdaAutoTaggingFunctionName` | `resource-tagging-automation-function` | Name of the Lambda function |
 | `EventBridgeRuleName` | `resource-tagging-automation-rules` | Name of the EventBridge rule |
 | `EnableRetroactiveTagging` | `'false'` | Set to `'true'` to run a one-time backfill that tags all existing resources missing the `MarkerTagKey` on initial stack creation. Safe to leave as `'true'` — only runs once on Create. |
-| `MarkerTagKey` | `BillingCode` | Tag key used to detect already-tagged resources during the retroactive backfill. Resources with this key are skipped. Only used when `EnableRetroactiveTagging` is `'true'`. |
+| `MarkerTagKey` | `BillingCode` | Tag key used to detect already-tagged resources during the retroactive backfill. Resources with this key are skipped. Only used when `EnableRetroactiveTagging` is `'true'`. Set to empty string (`''`) to skip the marker check and tag ALL resources — useful for updating tag values on existing resources (see [Stage 3](#stage-3-updating-tag-values-on-existing-resources)). |
 
 ## LZA Compatibility Notes
 

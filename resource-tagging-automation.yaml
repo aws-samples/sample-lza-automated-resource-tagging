@@ -50,7 +50,9 @@ Parameters:
       Tag key used by the retroactive backfill to detect already-tagged
       resources. Resources with this tag key are skipped. Should match
       one of the keys in AutomationTags. Only used when
-      EnableRetroactiveTagging is 'true'.
+      EnableRetroactiveTagging is 'true'. Set to empty string ('') to
+      skip the marker check and tag ALL resources — useful for updating
+      tag values on existing resources.
 
 Conditions:
   RetroactiveTaggingEnabled: !Equals [!Ref EnableRetroactiveTagging, 'true']
@@ -955,9 +957,10 @@ Resources:
                   })
 
           def tag_existing_resources(context):
-              """Scan all resources and tag those missing the marker tag."""
+              """Scan all resources and tag those missing the marker tag.
+              If marker_key is empty, tags ALL resources (useful for updating tag values)."""
               tags_json = os.environ.get('TAGS_JSON', '{}')
-              marker_key = os.environ.get('MARKER_TAG_KEY', 'BillingCode')
+              marker_key = os.environ.get('MARKER_TAG_KEY', '').strip()
 
               try:
                   tags = json.loads(tags_json)
@@ -967,6 +970,12 @@ Resources:
 
               if not tags:
                   return {'Message': 'No tags configured', 'Tagged': '0', 'Skipped': '0', 'Failed': '0'}
+
+              skip_tagged = bool(marker_key)
+              if skip_tagged:
+                  logger.info(f'Backfill mode: skipping resources that already have tag key "{marker_key}"')
+              else:
+                  logger.info('Tag update mode: MarkerTagKey is empty — tagging ALL resources (overwriting existing values)')
 
               client = boto3.client('resourcegroupstaggingapi')
               tagged_count = 0
@@ -992,12 +1001,14 @@ Resources:
                   untagged_arns = []
                   for resource in response.get('ResourceTagMappingList', []):
                       arn = resource['ResourceARN']
-                      existing_keys = {t['Key'] for t in resource.get('Tags', [])}
 
-                      if marker_key in existing_keys:
-                          skipped_count += 1
-                      else:
-                          untagged_arns.append(arn)
+                      if skip_tagged:
+                          existing_keys = {t['Key'] for t in resource.get('Tags', [])}
+                          if marker_key in existing_keys:
+                              skipped_count += 1
+                              continue
+
+                      untagged_arns.append(arn)
 
                   # Tag in batches
                   for i in range(0, len(untagged_arns), BATCH_SIZE):
