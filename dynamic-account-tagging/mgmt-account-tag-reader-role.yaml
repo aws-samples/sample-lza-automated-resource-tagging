@@ -1,0 +1,68 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+#
+# Management Account Role for Dynamic Account Tag Reading
+# Deploy this ONCE in the management account. It creates a read-only role
+# that workload account Lambdas assume to read account tags from Organizations.
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Read-only IAM role in the management account that allows workload account
+  Lambdas to call organizations:ListTagsForResource. Scoped by OrgID and
+  a specific role name pattern so only the tagging automation Lambda can assume it.
+
+Parameters:
+  OrganizationId:
+    Type: String
+    Description: >
+      Your AWS Organization ID (e.g., o-abc1234567). Used in the trust policy
+      to restrict which accounts can assume this role.
+    AllowedPattern: '^o-[a-z0-9]{10,32}$'
+    ConstraintDescription: Must be a valid AWS Organization ID (o-xxxxxxxxxx)
+
+  TrustedRoleName:
+    Type: String
+    Default: dynamic-account-tagging-role
+    Description: >
+      Name of the Lambda execution role in workload accounts that is allowed
+      to assume this role. Must match the role name in the workload template.
+
+Resources:
+  AccountTagReaderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: account-tag-reader-role
+      Description: >
+        Read-only role for dynamic account tag reading. Only allows
+        organizations:ListTagsForResource. Assumed by workload account
+        tagging automation Lambdas.
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: '*'
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:PrincipalOrgID: !Ref OrganizationId
+              ArnLike:
+                aws:PrincipalArn: !Sub 'arn:${AWS::Partition}:iam::*:role/${TrustedRoleName}'
+      Policies:
+        - PolicyName: read-account-tags
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ListAccountTags
+                Effect: Allow
+                Action:
+                  - organizations:ListTagsForResource
+                Resource: '*'
+
+Outputs:
+  AccountTagReaderRoleArn:
+    Description: ARN of the role workload Lambdas assume to read account tags
+    Value: !GetAtt AccountTagReaderRole.Arn
+    Export:
+      Name: AccountTagReaderRoleArn

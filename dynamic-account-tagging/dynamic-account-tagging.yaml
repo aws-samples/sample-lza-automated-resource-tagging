@@ -1,0 +1,1105 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+#
+# Dynamic Account Tagging Automation
+# Reads tags from the AWS account (set in Control Tower) and applies them
+# to every new resource created in the account. No tag values in YAML.
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Dynamic resource tagging automation that inherits tags from the AWS account
+  (set via Control Tower) and applies them to new resources at creation time.
+  No hardcoded tag values — reads account tags from Organizations API at runtime.
+  Deploy as a StackSet across OUs for zero per-account configuration.
+
+Parameters:
+  ManagementAccountId:
+    Type: String
+    Description: >
+      AWS Account ID of the management account where the
+      account-tag-reader-role is deployed.
+    AllowedPattern: '^\d{12}$'
+    ConstraintDescription: Must be a 12-digit AWS account ID
+
+  TagReaderRoleName:
+    Type: String
+    Default: account-tag-reader-role
+    Description: >
+      Name of the IAM role in the management account that allows
+      reading account tags. Must match the role deployed by
+      mgmt-account-tag-reader-role.yaml.
+
+  LambdaFunctionName:
+    Type: String
+    Default: dynamic-account-tagging-function
+    Description: Name of the Lambda function
+
+  EventBridgeRuleName:
+    Type: String
+    Default: dynamic-account-tagging-rules
+    Description: Name of the EventBridge rule
+
+  TagCacheTTLSeconds:
+    Type: Number
+    Default: 300
+    MinValue: 60
+    MaxValue: 3600
+    Description: >
+      How long (in seconds) to cache account tags before re-fetching
+      from Organizations. Default 300 (5 minutes). Reduces cross-account
+      API calls. Set lower if you need tag changes to propagate faster.
+
+  ExcludeTagKeys:
+    Type: String
+    Default: ''
+    Description: >
+      Comma-separated list of account tag keys to NOT propagate to resources.
+      Example: "aws:cloudformation:stack-name,internal-only"
+      Leave empty to propagate all account tags.
+
+  EnableRetroactiveTagging:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: >
+      Set to 'true' to run a one-time backfill that tags all existing
+      resources with the account's current tags. Runs once on stack create.
+
+  MarkerTagKey:
+    Type: String
+    Default: ''
+    Description: >
+      Tag key used by the retroactive backfill to detect already-tagged
+      resources. Resources with this tag key are skipped. Should match
+      one of the keys on the account. Only used when
+      EnableRetroactiveTagging is 'true'. Set to empty string to
+      tag ALL resources (useful for updating tag values).
+
+Conditions:
+  RetroactiveTaggingEnabled: !Equals [!Ref EnableRetroactiveTagging, 'true']
+
+Resources:
+
+  # ============================================================
+  # KMS — encryption for Lambda CloudWatch Logs and env vars
+  # ============================================================
+
+  EncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Encryption key for dynamic account tagging automation
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableRootAccountAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+          - Sid: AllowCloudWatchLogsEncrypt
+            Effect: Allow
+            Principal:
+              Service: !Sub logs.${AWS::Region}.amazonaws.com
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+            Resource: '*'
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${LambdaFunctionName}*
+          - Sid: AllowCloudWatchLogsDescribeKey
+            Effect: Allow
+            Principal:
+              Service: !Sub logs.${AWS::Region}.amazonaws.com
+            Action:
+              - kms:DescribeKey
+            Resource: '*'
+          - Sid: AllowLambdaEnvVarEncrypt
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+              - kms:CreateGrant
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              StringEquals:
+                kms:ViaService: !Sub lambda.${AWS::Region}.amazonaws.com
+
+  EncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/dynamic-account-tagging-key
+      TargetKeyId: !Ref EncryptionKey
+
+  # ============================================================
+  # Lambda CloudWatch Log Group
+  # ============================================================
+
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${LambdaFunctionName}
+      RetentionInDays: 90
+      KmsKeyId: !GetAtt EncryptionKey.Arn
+
+  # ============================================================
+  # SQS Dead-Letter Queue
+  # ============================================================
+
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${LambdaFunctionName}-dlq
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId: !GetAtt EncryptionKey.Arn
+
+  DeadLetterQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref DeadLetterQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowLambdaServiceSendMessage
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt DeadLetterQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${LambdaFunctionName}
+
+  DeadLetterQueueAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${LambdaFunctionName}-dlq-alarm
+      AlarmDescription: Alarm when failed tagging events land in the dead-letter queue
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt DeadLetterQueue.QueueName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  # ============================================================
+  # IAM Role — tagging + cross-account STS assume
+  # ============================================================
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: dynamic-account-tagging-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: dynamic-account-tagging-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AssumeTagReaderRole
+                Effect: Allow
+                Action:
+                  - sts:AssumeRole
+                Resource: !Sub arn:${AWS::Partition}:iam::${ManagementAccountId}:role/${TagReaderRoleName}
+              - Sid: TaggingAPI
+                Effect: Allow
+                Action:
+                  - tag:TagResources
+                  - tag:GetResources
+                  - tag:GetTagKeys
+                  - tag:GetTagValues
+                  - tag:UntagResources
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    aws:PrincipalAccount: !Ref AWS::AccountId
+              - Sid: EC2Tagging
+                Effect: Allow
+                Action:
+                  - ec2:CreateTags
+                  - ec2:DescribeVolumes
+                  - ec2:DescribeNatGateways
+                  - ec2:DescribeInternetGateways
+                  - ec2:DescribeVpcEndpoints
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    aws:PrincipalAccount: !Ref AWS::AccountId
+              - Sid: ServiceTagging
+                Effect: Allow
+                Action:
+                  - dynamodb:TagResource
+                  - lambda:TagResource
+                  - lambda:ListTags
+                  - s3:GetBucketTagging
+                  - s3:PutBucketTagging
+                  - rds:AddTagsToResource
+                  - sns:TagResource
+                  - sqs:TagQueue
+                  - sqs:ListQueueTags
+                  - es:AddTags
+                  - kms:TagResource
+                  - kms:ListResourceTags
+                  - elasticfilesystem:TagResource
+                  - elasticloadbalancing:AddTags
+                  - redshift:CreateTags
+                  - redshift-serverless:TagResource
+                  - sagemaker:AddTags
+                  - ecs:TagResource
+                  - kafka:TagResource
+                  - logs:TagLogGroup
+                  - logs:TagResource
+                  - cloudwatch:TagResource
+                  - mq:CreateTags
+                  - secretsmanager:TagResource
+                  - states:TagResource
+                  - kinesis:AddTagsToStream
+                  - apigateway:POST
+                  - apigateway:PUT
+                  - events:TagResource
+                  - codebuild:UpdateProject
+                  - codepipeline:TagResource
+                  - glue:TagResource
+                  - elasticache:AddTagsToResource
+                  - ecr:TagResource
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    aws:PrincipalAccount: !Ref AWS::AccountId
+              - Sid: DLQAccess
+                Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt DeadLetterQueue.Arn
+
+  # ============================================================
+  # Lambda — dynamically reads account tags, applies to resources
+  # ============================================================
+
+  LambdaAutoTagging:
+    Type: AWS::Lambda::Function
+    DependsOn: LambdaLogGroup
+    Properties:
+      Role: !GetAtt LambdaExecutionRole.Arn
+      FunctionName: !Ref LambdaFunctionName
+      Handler: index.main
+      Runtime: python3.13
+      Timeout: 300
+      MemorySize: 256
+      ReservedConcurrentExecutions: 10
+      KmsKeyArn: !GetAtt EncryptionKey.Arn
+      DeadLetterConfig:
+        TargetArn: !GetAtt DeadLetterQueue.Arn
+      Environment:
+        Variables:
+          MANAGEMENT_ACCOUNT_ID: !Ref ManagementAccountId
+          TAG_READER_ROLE_NAME: !Ref TagReaderRoleName
+          TAG_CACHE_TTL: !Ref TagCacheTTLSeconds
+          EXCLUDE_TAG_KEYS: !Ref ExcludeTagKeys
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import json
+          import logging
+          import time
+          from datetime import datetime, timezone
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          tagging_client = boto3.client('resourcegroupstaggingapi')
+          sts_client = boto3.client('sts')
+
+          # In-memory tag cache (persists across warm Lambda invocations)
+          _tag_cache = {}
+          _cache_timestamp = 0
+
+          # Allowlist of valid event sources
+          VALID_SOURCES = {
+              'aws.ec2', 'aws.lambda', 'aws.ecs', 'aws.sagemaker', 'aws.s3',
+              'aws.elasticfilesystem', 'aws.rds', 'aws.dynamodb', 'aws.elasticache',
+              'aws.redshift', 'aws.redshift-serverless', 'aws.neptune',
+              'aws.elasticloadbalancing', 'aws.apigateway', 'aws.es', 'aws.kafka',
+              'aws.kinesis', 'aws.glue', 'aws.sns', 'aws.sqs', 'aws.states',
+              'aws.events', 'aws.kms', 'aws.secretsmanager', 'aws.logs',
+              'aws.monitoring', 'aws.amazonmq', 'aws.codebuild', 'aws.codepipeline',
+              'aws.ecr',
+          }
+
+          def get_account_tags():
+              """Fetch account tags from Organizations via cross-account role.
+              Caches results for TAG_CACHE_TTL seconds to reduce API calls."""
+              global _tag_cache, _cache_timestamp
+
+              ttl = int(os.environ.get('TAG_CACHE_TTL', '300'))
+              now = time.time()
+
+              if _tag_cache and (now - _cache_timestamp) < ttl:
+                  logger.info('Using cached account tags')
+                  return _tag_cache
+
+              mgmt_account = os.environ['MANAGEMENT_ACCOUNT_ID']
+              role_name = os.environ['TAG_READER_ROLE_NAME']
+              exclude_keys_str = os.environ.get('EXCLUDE_TAG_KEYS', '')
+              exclude_keys = {k.strip() for k in exclude_keys_str.split(',') if k.strip()}
+
+              # Get current account ID
+              caller = sts_client.get_caller_identity()
+              account_id = caller['Account']
+
+              # Determine partition from current region
+              region = os.environ.get('AWS_REGION', 'us-east-1')
+              partition = get_partition(region)
+
+              # Assume the read-only role in the management account
+              role_arn = f'arn:{partition}:iam::{mgmt_account}:role/{role_name}'
+              logger.info(f'Assuming role {role_arn} to read account tags')
+
+              assumed = sts_client.assume_role(
+                  RoleArn=role_arn,
+                  RoleSessionName='dynamic-account-tagging',
+                  DurationSeconds=900
+              )
+
+              # Create Organizations client with assumed credentials
+              creds = assumed['Credentials']
+              org_client = boto3.client(
+                  'organizations',
+                  aws_access_key_id=creds['AccessKeyId'],
+                  aws_secret_access_key=creds['SecretAccessKey'],
+                  aws_session_token=creds['SessionToken']
+              )
+
+              # Fetch tags for this account
+              response = org_client.list_tags_for_resource(ResourceId=account_id)
+              raw_tags = {t['Key']: t['Value'] for t in response.get('Tags', [])}
+
+              # Filter out excluded keys and aws: prefixed keys
+              tags = {
+                  k: v for k, v in raw_tags.items()
+                  if k not in exclude_keys and not k.startswith('aws:')
+              }
+
+              logger.info(f'Account {account_id} tags: {json.dumps(tags)} (excluded: {exclude_keys}, aws:-prefixed filtered)')
+
+              _tag_cache = tags
+              _cache_timestamp = now
+              return tags
+
+          def get_partition(region):
+              if region.startswith('cn-'):
+                  return 'aws-cn'
+              if region.startswith('us-gov-'):
+                  return 'aws-us-gov'
+              return 'aws'
+
+          def get_identity(event):
+              try:
+                  identity = event['detail']['userIdentity']
+                  if identity.get('type') == 'AssumedRole':
+                      arn = identity.get('arn', '')
+                      return arn.split('/')[-1] if '/' in arn else arn
+                  elif identity.get('type') == 'IAMUser':
+                      return identity.get('userName', 'unknown')
+                  elif identity.get('type') == 'Root':
+                      return 'root'
+                  elif identity.get('type') == 'FederatedUser':
+                      return identity.get('principalId', '').split(':')[-1]
+                  return identity.get('principalId', 'unknown')
+              except Exception:
+                  return 'unknown'
+
+          def build_arn(partition, service, region, account, resource):
+              return f'arn:{partition}:{service}:{region}:{account}:{resource}'
+
+          # ---- Resource ARN extractors (same as original) ----
+
+          def aws_ec2(event, partition):
+              arnList = []
+              account = event['account']
+              region = event['region']
+              detail = event['detail']
+              name = detail['eventName']
+              if name == 'RunInstances':
+                  ec2 = boto3.resource('ec2')
+                  for item in detail['responseElements']['instancesSet']['items']:
+                      iid = item['instanceId']
+                      arnList.append(build_arn(partition, 'ec2', region, account, f'instance/{iid}'))
+                      try:
+                          instance = ec2.Instance(iid)
+                          for vol in instance.volumes.all():
+                              arnList.append(build_arn(partition, 'ec2', region, account, f'volume/{vol.id}'))
+                      except Exception as e:
+                          logger.warning(f'Could not get volumes for {iid}: {e}')
+              elif name == 'CreateVolume':
+                  arnList.append(build_arn(partition, 'ec2', region, account, f'volume/{detail["responseElements"]["volumeId"]}'))
+              elif name == 'AllocateAddress':
+                  arnList.append(build_arn(partition, 'ec2', region, account, f'elastic-ip/{detail["responseElements"]["allocationId"]}'))
+              elif name == 'CreateNatGateway':
+                  ngw = detail['responseElements']['CreateNatGatewayResponse']['natGateway']['natGatewayId']
+                  arnList.append(build_arn(partition, 'ec2', region, account, f'natgateway/{ngw}'))
+              elif name == 'CreateInternetGateway':
+                  igw = detail['responseElements']['internetGateway']['internetGatewayId']
+                  arnList.append(build_arn(partition, 'ec2', region, account, f'internet-gateway/{igw}'))
+              elif name == 'CreateVpcEndpoint':
+                  vpce = detail['responseElements']['CreateVpcEndpointResponse']['vpcEndpoint']['vpcEndpointId']
+                  arnList.append(build_arn(partition, 'ec2', region, account, f'vpc-endpoint/{vpce}'))
+              elif name == 'CreateTransitGateway':
+                  tgw = detail['responseElements']['CreateTransitGatewayResponse']['transitGateway']['transitGatewayId']
+                  arnList.append(build_arn(partition, 'ec2', region, account, f'transit-gateway/{tgw}'))
+              elif name == 'CreateSecurityGroup':
+                  arnList.append(build_arn(partition, 'ec2', region, account, f'security-group/{detail["responseElements"]["groupId"]}'))
+              return arnList
+
+          def aws_lambda(event, partition):
+              resp = event['detail']['responseElements']
+              if resp and event['detail']['eventName'] == 'CreateFunction20150331':
+                  return [resp['functionArn']]
+              return []
+
+          def aws_ecs(event, partition):
+              name = event['detail']['eventName']
+              if name == 'CreateCluster':
+                  return [event['detail']['responseElements']['cluster']['clusterArn']]
+              elif name == 'CreateService':
+                  return [event['detail']['responseElements']['service']['serviceArn']]
+              return []
+
+          def aws_sagemaker(event, partition):
+              name = event['detail']['eventName']
+              resp = event['detail']['responseElements']
+              mapping = {
+                  'CreateNotebookInstance': 'notebookInstanceArn',
+                  'CreateProcessingJob': 'processingJobArn',
+                  'CreateEndpoint': 'endpointArn',
+                  'CreateDomain': 'domainArn',
+                  'CreateModel': 'modelArn',
+                  'CreateLabelingJob': 'labelingJobArn',
+                  'CreateTrainingJob': 'trainingJobArn',
+                  'CreateTransformJob': 'transformJobArn',
+                  'CreateUserProfile': 'userProfileArn',
+                  'CreateWorkteam': 'workteamArn',
+              }
+              if name in mapping and resp:
+                  return [resp[mapping[name]]]
+              return []
+
+          def aws_s3(event, partition):
+              if event['detail']['eventName'] == 'CreateBucket':
+                  bucket = event['detail']['requestParameters']['bucketName']
+                  return [f'arn:{partition}:s3:::{bucket}']
+              return []
+
+          def aws_elasticfilesystem(event, partition):
+              if event['detail']['eventName'] == 'CreateMountTarget':
+                  account = event['account']
+                  region = event['region']
+                  fsid = event['detail']['responseElements']['fileSystemId']
+                  return [build_arn(partition, 'elasticfilesystem', region, account, f'file-system/{fsid}')]
+              return []
+
+          def aws_rds(event, partition):
+              name = event['detail']['eventName']
+              resp = event['detail']['responseElements']
+              if name == 'CreateDBInstance' and resp:
+                  return [resp['dBInstanceArn']]
+              elif name == 'CreateDBCluster' and resp:
+                  return [resp['dBClusterArn']]
+              return []
+
+          def aws_dynamodb(event, partition):
+              if event['detail']['eventName'] == 'CreateTable':
+                  return [event['detail']['responseElements']['tableDescription']['tableArn']]
+              return []
+
+          def aws_elasticache(event, partition):
+              name = event['detail']['eventName']
+              resp = event['detail']['responseElements']
+              arns = []
+              if name in ('CreateCacheCluster', 'CreateReplicationGroup') and resp:
+                  arn = resp.get('aRN', resp.get('arn', ''))
+                  if arn:
+                      arns.append(arn)
+              return arns
+
+          def aws_redshift(event, partition):
+              if event['detail']['eventName'] == 'CreateCluster':
+                  account = event['account']
+                  region = event['region']
+                  cid = event['detail']['requestParameters']['clusterIdentifier']
+                  return [build_arn(partition, 'redshift', region, account, f'cluster:{cid}')]
+              return []
+
+          def aws_redshift_serverless(event, partition):
+              name = event['detail']['eventName']
+              resp = event['detail']['responseElements']
+              if name == 'CreateWorkgroup':
+                  return [resp['workgroup']['workgroupArn']]
+              elif name == 'CreateNamespace':
+                  return [resp['namespace']['namespaceArn']]
+              return []
+
+          def aws_neptune(event, partition):
+              name = event['detail']['eventName']
+              resp = event['detail']['responseElements']
+              arns = []
+              if name == 'CreateDBCluster' and resp:
+                  arn = resp.get('dBClusterArn', '')
+                  if arn: arns.append(arn)
+              elif name == 'CreateDBInstance' and resp:
+                  arn = resp.get('dBInstanceArn', '')
+                  if arn: arns.append(arn)
+              return arns
+
+          def aws_elasticloadbalancing(event, partition):
+              if event['detail']['eventName'] == 'CreateLoadBalancer':
+                  resp = event['detail']['responseElements']
+                  if 'loadBalancers' in resp:
+                      return [lb['loadBalancerArn'] for lb in resp['loadBalancers']]
+              return []
+
+          def aws_apigateway(event, partition):
+              region = event['region']
+              name = event['detail']['eventName']
+              resp = event['detail']['responseElements']
+              if name == 'CreateRestApi' and resp:
+                  api_id = resp.get('id', '')
+                  if api_id: return [f'arn:{partition}:apigateway:{region}::/restapis/{api_id}']
+              elif name == 'CreateApi' and resp:
+                  api_id = resp.get('apiId', '')
+                  if api_id: return [f'arn:{partition}:apigateway:{region}::/apis/{api_id}']
+              return []
+
+          def aws_es(event, partition):
+              if event['detail']['eventName'] == 'CreateDomain':
+                  return [event['detail']['responseElements']['domainStatus']['aRN']]
+              return []
+
+          def aws_kafka(event, partition):
+              if event['detail']['eventName'] == 'CreateClusterV2':
+                  return [event['detail']['responseElements']['clusterArn']]
+              return []
+
+          def aws_kinesis(event, partition):
+              if event['detail']['eventName'] == 'CreateStream':
+                  account = event['account']
+                  region = event['region']
+                  stream = event['detail']['requestParameters']['streamName']
+                  return [build_arn(partition, 'kinesis', region, account, f'stream/{stream}')]
+              return []
+
+          def aws_glue(event, partition):
+              account = event['account']
+              region = event['region']
+              name = event['detail']['eventName']
+              req = event['detail']['requestParameters']
+              if name == 'CreateJob':
+                  return [build_arn(partition, 'glue', region, account, f'job/{req["name"]}')]
+              elif name == 'CreateCrawler':
+                  return [build_arn(partition, 'glue', region, account, f'crawler/{req["name"]}')]
+              elif name == 'CreateDatabase':
+                  db = req.get('databaseInput', {}).get('name', '')
+                  if db: return [build_arn(partition, 'glue', region, account, f'database/{db}')]
+              return []
+
+          def aws_sns(event, partition):
+              if event['detail']['eventName'] == 'CreateTopic':
+                  account = event['account']
+                  region = event['region']
+                  return [build_arn(partition, 'sns', region, account, event['detail']['requestParameters']['name'])]
+              return []
+
+          def aws_sqs(event, partition):
+              if event['detail']['eventName'] == 'CreateQueue':
+                  account = event['account']
+                  region = event['region']
+                  return [build_arn(partition, 'sqs', region, account, event['detail']['requestParameters']['queueName'])]
+              return []
+
+          def aws_states(event, partition):
+              if event['detail']['eventName'] == 'CreateStateMachine':
+                  resp = event['detail']['responseElements']
+                  if resp: return [resp['stateMachineArn']]
+              return []
+
+          def aws_events(event, partition):
+              if event['detail']['eventName'] == 'CreateEventBus':
+                  resp = event['detail']['responseElements']
+                  if resp: return [resp['eventBusArn']]
+              return []
+
+          def aws_kms(event, partition):
+              if event['detail']['eventName'] == 'CreateKey':
+                  return [event['detail']['responseElements']['keyMetadata']['arn']]
+              return []
+
+          def aws_secretsmanager(event, partition):
+              if event['detail']['eventName'] == 'CreateSecret':
+                  return [event['detail']['responseElements']['aRN']]
+              return []
+
+          def aws_logs(event, partition):
+              if event['detail']['eventName'] == 'CreateLogGroup':
+                  account = event['account']
+                  region = event['region']
+                  lg = event['detail']['requestParameters']['logGroupName']
+                  return [build_arn(partition, 'logs', region, account, f'log-group:{lg}')]
+              return []
+
+          def aws_monitoring(event, partition):
+              if event['detail']['eventName'] == 'PutMetricAlarm':
+                  account = event['account']
+                  region = event['region']
+                  alarm = event['detail']['requestParameters']['alarmName']
+                  return [build_arn(partition, 'cloudwatch', region, account, f'alarm:{alarm}')]
+              return []
+
+          def aws_amazonmq(event, partition):
+              if event['detail']['eventName'] == 'CreateBroker':
+                  return [event['detail']['responseElements']['brokerArn']]
+              return []
+
+          def aws_codebuild(event, partition):
+              if event['detail']['eventName'] == 'CreateProject':
+                  resp = event['detail']['responseElements']
+                  if resp and 'project' in resp:
+                      return [resp['project']['arn']]
+              return []
+
+          def aws_codepipeline(event, partition):
+              if event['detail']['eventName'] == 'CreatePipeline':
+                  resp = event['detail']['responseElements']
+                  if resp and 'pipeline' in resp:
+                      account = event['account']
+                      region = event['region']
+                      return [build_arn(partition, 'codepipeline', region, account, resp['pipeline']['name'])]
+              return []
+
+          def aws_ecr(event, partition):
+              if event['detail']['eventName'] == 'CreateRepository':
+                  resp = event['detail']['responseElements']
+                  if resp and 'repository' in resp:
+                      return [resp['repository']['repositoryArn']]
+              return []
+
+          HANDLER_MAP = {
+              'aws.ec2': aws_ec2, 'aws.lambda': aws_lambda, 'aws.ecs': aws_ecs,
+              'aws.sagemaker': aws_sagemaker, 'aws.s3': aws_s3,
+              'aws.elasticfilesystem': aws_elasticfilesystem, 'aws.rds': aws_rds,
+              'aws.dynamodb': aws_dynamodb, 'aws.elasticache': aws_elasticache,
+              'aws.redshift': aws_redshift, 'aws.redshift-serverless': aws_redshift_serverless,
+              'aws.neptune': aws_neptune, 'aws.elasticloadbalancing': aws_elasticloadbalancing,
+              'aws.apigateway': aws_apigateway, 'aws.es': aws_es, 'aws.kafka': aws_kafka,
+              'aws.kinesis': aws_kinesis, 'aws.glue': aws_glue, 'aws.sns': aws_sns,
+              'aws.sqs': aws_sqs, 'aws.states': aws_states, 'aws.events': aws_events,
+              'aws.kms': aws_kms, 'aws.secretsmanager': aws_secretsmanager,
+              'aws.logs': aws_logs, 'aws.monitoring': aws_monitoring,
+              'aws.amazonmq': aws_amazonmq, 'aws.codebuild': aws_codebuild,
+              'aws.codepipeline': aws_codepipeline, 'aws.ecr': aws_ecr,
+          }
+
+          def main(event, context):
+              logger.info(f'Event source: {event["source"]}, Event: {event["detail"]["eventName"]}')
+
+              source = event['source']
+              if source not in VALID_SOURCES:
+                  logger.warning(f'Unexpected event source: {source}')
+                  return {'statusCode': 400, 'body': 'Unknown event source'}
+
+              handler = HANDLER_MAP.get(source)
+              if not handler:
+                  logger.warning(f'No handler for source: {source}')
+                  return {'statusCode': 200, 'body': 'No handler'}
+
+              partition = get_partition(event['region'])
+
+              try:
+                  resARNs = handler(event, partition)
+              except Exception as e:
+                  logger.error(f'Handler for {source} failed: {e}')
+                  return {'statusCode': 500, 'body': f'Handler error: {str(e)}'}
+
+              resARNs = [a for a in (resARNs or []) if a]
+              if not resARNs:
+                  logger.info('No resource ARNs to tag')
+                  return {'statusCode': 200, 'body': 'No resources to tag'}
+
+              # Dynamically fetch account tags from Organizations
+              try:
+                  res_tags = get_account_tags()
+              except Exception as e:
+                  logger.error(f'Failed to fetch account tags: {e}')
+                  return {'statusCode': 500, 'body': f'Failed to fetch account tags: {str(e)}'}
+
+              if not res_tags:
+                  logger.warning('No account tags found — nothing to apply')
+                  return {'statusCode': 200, 'body': 'No account tags configured'}
+
+              # Copy so we don't mutate the cache
+              res_tags = dict(res_tags)
+
+              # Add metadata tags
+              res_tags['CreatedBy'] = get_identity(event)
+              res_tags['CreatedDate'] = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+              logger.info(f'Tagging {len(resARNs)} resource(s) with {len(res_tags)} tags')
+
+              for i in range(0, len(resARNs), 20):
+                  batch = resARNs[i:i+20]
+                  try:
+                      tagging_client.tag_resources(ResourceARNList=batch, Tags=res_tags)
+                  except Exception as e:
+                      logger.error(f'Failed to tag batch {batch}: {e}')
+
+              return {'statusCode': 200, 'body': f'Tagged {len(resARNs)} resource(s)'}
+
+  # ============================================================
+  # EventBridge — filters resource creation events
+  # ============================================================
+
+  EventBridgeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Triggers dynamic account tagging Lambda on resource creation events
+      Name: !Ref EventBridgeRuleName
+      EventPattern:
+        detail-type:
+          - AWS API Call via CloudTrail
+        source:
+          - aws.ec2
+          - aws.elasticloadbalancing
+          - aws.rds
+          - aws.lambda
+          - aws.s3
+          - aws.dynamodb
+          - aws.elasticfilesystem
+          - aws.es
+          - aws.sqs
+          - aws.sns
+          - aws.kms
+          - aws.ecs
+          - aws.redshift
+          - aws.redshift-serverless
+          - aws.sagemaker
+          - aws.monitoring
+          - aws.logs
+          - aws.kafka
+          - aws.amazonmq
+          - aws.secretsmanager
+          - aws.states
+          - aws.kinesis
+          - aws.apigateway
+          - aws.events
+          - aws.codebuild
+          - aws.codepipeline
+          - aws.glue
+          - aws.neptune
+          - aws.elasticache
+          - aws.ecr
+        detail:
+          eventName:
+            - RunInstances
+            - CreateVolume
+            - AllocateAddress
+            - CreateNatGateway
+            - CreateInternetGateway
+            - CreateVpcEndpoint
+            - CreateTransitGateway
+            - CreateSecurityGroup
+            - CreateFunction20150331
+            - CreateCluster
+            - CreateService
+            - CreateNotebookInstance
+            - CreateProcessingJob
+            - CreateEndpoint
+            - CreateDomain
+            - CreateModel
+            - CreateLabelingJob
+            - CreateTrainingJob
+            - CreateTransformJob
+            - CreateUserProfile
+            - CreateWorkteam
+            - CreateBucket
+            - CreateMountTarget
+            - CreateDBInstance
+            - CreateDBCluster
+            - CreateTable
+            - CreateCacheCluster
+            - CreateReplicationGroup
+            - CreateLoadBalancer
+            - CreateRestApi
+            - CreateApi
+            - CreateClusterV2
+            - CreateStream
+            - CreateJob
+            - CreateCrawler
+            - CreateDatabase
+            - CreateTopic
+            - CreateQueue
+            - CreateStateMachine
+            - CreateEventBus
+            - CreateKey
+            - CreateSecret
+            - CreateLogGroup
+            - PutMetricAlarm
+            - CreateBroker
+            - CreateNamespace
+            - CreateWorkgroup
+            - CreateProject
+            - CreatePipeline
+            - CreateRepository
+      Targets:
+        - Arn: !GetAtt LambdaAutoTagging.Arn
+          Id: !Ref LambdaFunctionName
+
+  PermissionForEventsToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LambdaFunctionName
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt EventBridgeRule.Arn
+
+  # ============================================================
+  # Retroactive Backfill (conditional)
+  # ============================================================
+
+  RetroactiveLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: RetroactiveTaggingEnabled
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${LambdaFunctionName}-backfill
+      RetentionInDays: 90
+      KmsKeyId: !GetAtt EncryptionKey.Arn
+
+  RetroactiveBackfillFunction:
+    Type: AWS::Lambda::Function
+    Condition: RetroactiveTaggingEnabled
+    DependsOn: RetroactiveLogGroup
+    Properties:
+      Role: !GetAtt LambdaExecutionRole.Arn
+      FunctionName: !Sub ${LambdaFunctionName}-backfill
+      Handler: index.handler
+      Runtime: python3.13
+      Timeout: 900
+      MemorySize: 512
+      KmsKeyArn: !GetAtt EncryptionKey.Arn
+      Environment:
+        Variables:
+          MANAGEMENT_ACCOUNT_ID: !Ref ManagementAccountId
+          TAG_READER_ROLE_NAME: !Ref TagReaderRoleName
+          EXCLUDE_TAG_KEYS: !Ref ExcludeTagKeys
+          MARKER_TAG_KEY: !Ref MarkerTagKey
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import json
+          import logging
+          import os
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          BATCH_SIZE = 20
+          TIMEOUT_BUFFER_MS = 30000
+
+          def get_partition(region):
+              if region.startswith('cn-'):
+                  return 'aws-cn'
+              if region.startswith('us-gov-'):
+                  return 'aws-us-gov'
+              return 'aws'
+
+          def fetch_account_tags():
+              """Fetch account tags from Organizations via cross-account role."""
+              sts = boto3.client('sts')
+              mgmt_account = os.environ['MANAGEMENT_ACCOUNT_ID']
+              role_name = os.environ['TAG_READER_ROLE_NAME']
+              exclude_keys_str = os.environ.get('EXCLUDE_TAG_KEYS', '')
+              exclude_keys = {k.strip() for k in exclude_keys_str.split(',') if k.strip()}
+
+              caller = sts.get_caller_identity()
+              account_id = caller['Account']
+              region = os.environ.get('AWS_REGION', 'us-east-1')
+              partition = get_partition(region)
+
+              role_arn = f'arn:{partition}:iam::{mgmt_account}:role/{role_name}'
+              assumed = sts.assume_role(
+                  RoleArn=role_arn,
+                  RoleSessionName='dynamic-account-tagging-backfill',
+                  DurationSeconds=900
+              )
+              creds = assumed['Credentials']
+              org_client = boto3.client(
+                  'organizations',
+                  aws_access_key_id=creds['AccessKeyId'],
+                  aws_secret_access_key=creds['SecretAccessKey'],
+                  aws_session_token=creds['SessionToken']
+              )
+              response = org_client.list_tags_for_resource(ResourceId=account_id)
+              raw_tags = {t['Key']: t['Value'] for t in response.get('Tags', [])}
+              tags = {k: v for k, v in raw_tags.items() if k not in exclude_keys and not k.startswith('aws:')}
+              logger.info(f'Account {account_id} tags for backfill: {json.dumps(tags)}')
+              return tags
+
+          def handler(event, context):
+              logger.info(f'RequestType: {event.get("RequestType")}')
+              if event.get('RequestType') != 'Create':
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                      'Message': f'{event.get("RequestType")} — nothing to do',
+                      'Tagged': '0', 'Skipped': '0', 'Failed': '0'
+                  })
+                  return
+
+              try:
+                  result = tag_existing_resources(context)
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, result)
+              except Exception as e:
+                  logger.error(f'Failed: {e}')
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                      'Message': f'Backfill completed with errors: {str(e)}',
+                      'Tagged': '0', 'Skipped': '0', 'Failed': '0'
+                  })
+
+          def tag_existing_resources(context):
+              marker_key = os.environ.get('MARKER_TAG_KEY', '').strip()
+
+              tags = fetch_account_tags()
+              if not tags:
+                  return {'Message': 'No account tags found', 'Tagged': '0', 'Skipped': '0', 'Failed': '0'}
+
+              skip_tagged = bool(marker_key)
+              if skip_tagged:
+                  logger.info(f'Backfill mode: skipping resources with tag key "{marker_key}"')
+              else:
+                  logger.info('Tag update mode: MarkerTagKey is empty — tagging ALL resources')
+
+              client = boto3.client('resourcegroupstaggingapi')
+              tagged_count = 0
+              skipped_count = 0
+              failed_count = 0
+              timed_out = False
+              pagination_token = ''
+
+              while True:
+                  remaining_ms = context.get_remaining_time_in_millis()
+                  if remaining_ms < TIMEOUT_BUFFER_MS:
+                      logger.warning(f'Approaching timeout ({remaining_ms}ms remaining). Stopping.')
+                      timed_out = True
+                      break
+
+                  params = {'ResourcesPerPage': 100}
+                  if pagination_token:
+                      params['PaginationToken'] = pagination_token
+
+                  response = client.get_resources(**params)
+                  untagged_arns = []
+                  for resource in response.get('ResourceTagMappingList', []):
+                      arn = resource['ResourceARN']
+                      if skip_tagged:
+                          existing_keys = {t['Key'] for t in resource.get('Tags', [])}
+                          if marker_key in existing_keys:
+                              skipped_count += 1
+                              continue
+                      untagged_arns.append(arn)
+
+                  for i in range(0, len(untagged_arns), BATCH_SIZE):
+                      if context.get_remaining_time_in_millis() < TIMEOUT_BUFFER_MS:
+                          logger.warning('Approaching timeout during tagging. Stopping.')
+                          failed_count += len(untagged_arns) - i
+                          timed_out = True
+                          break
+                      batch = untagged_arns[i:i + BATCH_SIZE]
+                      try:
+                          resp = client.tag_resources(ResourceARNList=batch, Tags=tags)
+                          failures = resp.get('FailedResourcesMap', {})
+                          tagged_count += len(batch) - len(failures)
+                          failed_count += len(failures)
+                          if failures:
+                              for arn, err in failures.items():
+                                  logger.warning(f'Failed to tag {arn}: {err}')
+                      except Exception as e:
+                          logger.error(f'Batch tagging failed: {e}')
+                          failed_count += len(batch)
+
+                  if timed_out:
+                      break
+                  pagination_token = response.get('PaginationToken', '')
+                  if not pagination_token:
+                      break
+
+              message = 'Retroactive tagging complete'
+              if timed_out:
+                  message = 'Partially complete (approaching timeout). Redeploy to continue.'
+              result = {
+                  'Message': message,
+                  'Tagged': str(tagged_count),
+                  'Skipped': str(skipped_count),
+                  'Failed': str(failed_count)
+              }
+              logger.info(f'Result: {json.dumps(result)}')
+              return result
+
+  TriggerRetroactiveTagging:
+    Type: Custom::RetroactiveTagging
+    Condition: RetroactiveTaggingEnabled
+    Properties:
+      ServiceToken: !GetAtt RetroactiveBackfillFunction.Arn
+
+Outputs:
+  LambdaFunctionArn:
+    Description: ARN of the dynamic account tagging Lambda function
+    Value: !GetAtt LambdaAutoTagging.Arn
+  EncryptionKeyArn:
+    Description: ARN of the KMS key
+    Value: !GetAtt EncryptionKey.Arn
+  EventBridgeRuleArn:
+    Description: ARN of the EventBridge rule
+    Value: !GetAtt EventBridgeRule.Arn
+  DeadLetterQueueArn:
+    Description: ARN of the dead-letter queue
+    Value: !GetAtt DeadLetterQueue.Arn
+  DeadLetterQueueUrl:
+    Description: URL of the dead-letter queue
+    Value: !Ref DeadLetterQueue
+  TagSource:
+    Description: Where tags are sourced from
+    Value: !Sub 'Account tags via Organizations API (management account ${ManagementAccountId})'
+  BackfillStatus:
+    Condition: RetroactiveTaggingEnabled
+    Description: Result of the retroactive tagging backfill
+    Value: !GetAtt TriggerRetroactiveTagging.Message
+  BackfillResourcesTagged:
+    Condition: RetroactiveTaggingEnabled
+    Description: Number of existing resources tagged by the backfill
+    Value: !GetAtt TriggerRetroactiveTagging.Tagged
+  BackfillResourcesSkipped:
+    Condition: RetroactiveTaggingEnabled
+    Description: Number of existing resources skipped (already tagged)
+    Value: !GetAtt TriggerRetroactiveTagging.Skipped

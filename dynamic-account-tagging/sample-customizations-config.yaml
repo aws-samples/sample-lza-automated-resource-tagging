@@ -1,0 +1,46 @@
+# Sample customizations-config.yaml for Dynamic Account Tagging
+#
+# This is ALL you need. One StackSet block covers every account in the OU.
+# No per-account tag values. No per-account YAML blocks.
+# Tags come from Control Tower account tags at runtime.
+
+customizations:
+  cloudFormationStackSets:
+    # ── Management account role (deploy once) ──────────────────
+    # This creates the read-only role that workload Lambdas assume.
+    # Deploy to the management account only.
+    - capabilities:
+        - CAPABILITY_NAMED_IAM
+      deploymentTargets:
+        accounts:
+          - Management                    # UPDATE: your management account name
+      name: AccountTagReaderRole
+      description: Read-only role for dynamic account tag reading
+      regions:
+        - us-west-2                       # Only needs one region (IAM is global)
+      template: customizations/mgmt-account-tag-reader-role.yaml
+      parameters:
+        - name: OrganizationId
+          value: 'o-xxxxxxxxxx'           # UPDATE: your Organization ID
+
+    # ── Workload account tagging (deploy to all accounts) ──────
+    # One block. All accounts in the OU get it. Tags come from
+    # Control Tower account tags — no values to configure here.
+    - capabilities:
+        - CAPABILITY_NAMED_IAM
+      deploymentTargets:
+        organizationalUnits:
+          - Tagged                         # UPDATE: your target OU(s)
+      name: DynamicAccountTagging
+      description: Auto-tags resources using Control Tower account tags
+      regions:                             # UPDATE: all governed regions
+        - us-west-2
+      template: customizations/dynamic-account-tagging.yaml
+      parameters:
+        - name: ManagementAccountId
+          value: '123456789012'            # UPDATE: your management account ID
+        # Optional: tag existing resources on first deploy
+        # - name: EnableRetroactiveTagging
+        #   value: 'true'
+        # - name: MarkerTagKey
+        #   value: BillingCode
